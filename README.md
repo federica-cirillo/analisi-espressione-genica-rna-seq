@@ -12,7 +12,7 @@ Finally, the differentially expressed genes are studied through functional enric
 
 ## Repository structure
 
-The report is provided both as an R Markdown source (rnaseq_analysis_GSE267074.Rmd) and as its rendered HTML version (rnaseq_analysis_GSE267074.html), which opens in any browser and shows the full analysis with code, figures and comments. The custom plotting and helper functions live separately in helper_functions.R and are documented with roxygen style annotations.
+The report is provided both as an R Markdown source (`rnaseq_analysis_GSE267074.Rmd`) and as its rendered HTML version (`rnaseq_analysis_GSE267074.html`), which opens in any browser and shows the full analysis with code, figures and comments. The custom plotting and helper functions live separately in `helper_functions.R` and are documented with roxygen style annotations.
 
 ## Tech stack
 
