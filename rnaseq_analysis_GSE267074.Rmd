@@ -1,0 +1,1300 @@
+---
+title: "Analisi RNA-seq di GSE267074"
+author: "Federica Cirillo"
+date: "18-05-2025"
+output: 
+    html_document:
+        code_folding: hide
+        toc: true
+        toc_float: true
+editor_options: 
+    chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, include=TRUE, cache=TRUE)
+```
+
+# 0. Introduzione
+
+La presente analisi riguarda il dataset **GSE267074**, derivato da uno studio di **bulk RNA‑seq** condotto su topi immunocompromessi portatori di xenotrapianti di **linfoma B‑cellulare non‑Hodgkin umano**, tumore maligno del sistema linfatico originato da cellule B, caratterizzato da crescita anomala e spesso aggressiva dei linfociti.
+
+I modelli sperimentali sono stati trattati con cellule **CAR‑T anti‑CD19** (umane), somministrate in due condizioni: 
+
+1) in combinazione con **tazemetostat**, farmaco inibitore selettivo della metiltransferasi **EZH2** (regolatore epigenetico coinvolto nella tumorigenesi e nella risposta immunitaria; subunità catalitica del complesso PRC2 il cui ruolo principale è trimetilare la lisina 27 dell'istone H3 portando alla formazione di *eterocromatina*) approvato per linfomi follicolari e noto per aumentare attivazione e infiltrazione  delle cellule CAR‑T nei tumori,
+2) oppure con un **veicolo** (controllo). 
+
+Le cellule CAR‑T anti‑CD19 sono cellule T umane *ingegnerizzate* per riconoscere la proteina CD19 sulle cellule B tumorali e distruggerle. Sono impiegate con successo nella terapia dei linfomi B-cellulari, anche in pazienti refrattari.
+
+Lo studio include sei topi xenotrapiantati, suddivisi equamente tra i due gruppi di trattamento (n = 3 per ciascun gruppo). Per ogni topo sono stati generati tre profili di espressione RNA‑seq, corrispondenti a repliche tecniche, per un totale di 18 campioni.
+
+L’obiettivo dell’analisi è identificare i cambiamenti trascrizionali e i pathway biologici indotti dal **trattamento combinato CAR-T19 + tazemetostat** rispetto al trattamento CAR-T19 + veicolo (controllo), al fine di chiarire i meccanismi molecolari alla base della potenziale sinergia terapeutica tra inibizione epigenetica e immunoterapia CAR-T.
+
+Dopo una fase di preprocessing dei dati (inclusi normalizzazione e individuazione di outlier), si procede con l’analisi differenziale dell’espressione genica. I geni significativamente deregolati vengono quindi sottoposti ad analisi di arricchimento funzionale per l’identificazione di percorsi biologici e processi molecolari coinvolti nella risposta terapeutica combinata.
+
+# 1. Preprocessing dei dati 
+
+## 1.1 Importazione librerie, download e preparazione dei dati
+
+```{r}
+# Importazione delle librerie utilizzate
+
+# Librerie per l'importazione e la manipolazione di dati omici
+library(GEOquery)             # Importazione dati da GEO
+library(SummarizedExperiment) # Struttura dati standard per espressione RNA-seq
+library(edgeR)               # Analisi di espressione differenziale (DEG)
+library(EDASeq)              # Normalizzazione e controllo qualità dati RNA-seq
+
+# Librerie per la visualizzazione grafica
+library(ggplot2)             # Grafici base
+library(pheatmap)            # Heatmap per visualizzazione matrici di espressione
+library(patchwork)           # Composizione di più grafici ggplot
+library(RColorBrewer)        # Palette di colori per visualizzazione
+
+# Librerie per l'analisi funzionale e l'arricchimento
+library(clusterProfiler)     # Analisi GO/KEGG, enrichment e visualizzazione
+library(enrichplot)          # Visualizzazione arricchimenti 
+library(org.Hs.eg.db)        # Database di annotazione (Homo sapiens)
+library(AnnotationDbi)       # mapIds e strumenti per conversione ID
+library(gprofiler2)          # Enrichment GO/KEGG/Reactome via g:Profiler
+
+# Librerie per l'alisi di pathway e reti biologiche
+library(ggkegg)              # Visualizzazione KEGG come grafo
+library(tidygraph)           # Analisi reti in formato tbl_graph
+library(ggraph)              # Visualizzazione reti (con tidygraph)
+
+# Librerie per il supporto e la manipolazione dei dati
+library(stringr)             # Operazioni su stringhe 
+library(dplyr)               # Manipolazione dati 
+
+```
+
+```{r}
+# Richiama il file contenenti le funzioni documentate
+source("FunzioniEsame_FedericaCirillo.R")
+```
+
+La prima fase consiste nell’ottenere i **dati grezzi di espressione genica da un esperimento di bulk RNA-seq**, partendo dalla repository pubblica GEO (Gene Expression Omnibus).
+
+Da GEO sono scaricati tutti i file supplementari associati alla serie GSE267074.
+
+Il dataset scelto è un file compresso .txt.gz contenente una matrice di conteggi genici, dove le righe rappresentano i geni e le colonne rappresentano i campioni biologici (topi) e tecnici (repliche su ogni topo). 
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# Codice della serie GEO
+serie <- "GSE267074"
+
+# Scarica tutti i file supplementari nella cartella ./GSE267074
+getGEOSuppFiles(serie)
+```
+E' stato quindi selezionato il file che contiene i dati raw di conteggio e letto in forma tabellare.
+
+La tabella riporta i conteggi grezzi di espressione genica ottenuti da bulk RNA-seq, organizzati con:
+
+- **gene_id**: identificatore univoco del gene, basato su codici Ensembl;
+- **M_766_A, M_766_B, M_766_C, M_767_A, M_767_B, ... **: colonne corrispondenti ai diversi campioni di RNA-seq, ciascuno rappresentante una replica tecnica di un topo specifico. I nomi indicano l'identificativo del topo (ad esempio, *M_766*) e la replica tecnica (*A, B, C*);
+- I valori numerici in tabella indicano quante volte ogni gene è stato letto in ciascun campione (**read counts**).
+
+```{r}
+# Identifica il file di raw counts dei geni
+# Il file è di tipo .txt.gz con righe = geni e colonne = campioni
+file_counts <- file.path(serie, grep("GSE267074_Bulk_Dissected_Tumors_gene_count_excel.txt.gz", list.files(serie), value = TRUE))
+
+# Legge il file come tabella
+dat <- read.table(file_counts,
+                  header = TRUE,
+                  sep = "\t",
+                  stringsAsFactors = FALSE,
+                  check.names = FALSE)
+
+# Visualizza le prime righe
+head(dat[, 1:6])
+```
+
+## 1.2 Costruzione della matrice di conteggi
+
+In questa fase si procede alla preparazione della **matrice di conteggi grezzi** (raw counts) di espressione genica, fondamentale per l’analisi di espressione differenziale.
+
+- Viene estratta la prima colonna del dataset originale che contiene gli identificativi univoci dei geni. Questi saranno usati come nomi delle righe della matrice finale, assicurando una chiara mappatura tra ogni riga e il gene corrispondente.
+- Vengono selezionate le colonne campione attraverso un filtro basato sul nome in modo che vengano utilizzate solo le colonne contenenti dati di espressione e non altre informazioni o annotazioni presenti nel dataset.
+- Le colonne selezionate vengono convertite in una matrice numerica di **interi** (matrice di conteggi) requisito essenziale per molte librerie di analisi di RNA-seq che richiedono matrici numeriche come input. Alle righe vengono assegnati gli identificatori genici precedentemente estratti.
+
+Il valore numerico in ciascuna cella della matrice di conteggi rappresenta quante volte le sequenze lette sono state assegnate a quel gene nel campione.
+
+La matrice risultante ha dimensioni 16282 x 18, indicanti **16.282 geni** misurati in **18 campioni**:
+
+```{r}
+# Estrae gli identificativi dei geni che si trovano nella prima colonna
+gene_ids <- dat$gene_id
+
+# Costruisce la matrice dei conteggi
+sample_cols <- grep("^M_", colnames(dat), value = TRUE) # prende le colonne che iniziano per "M_*" (campioni)
+counts <- as.matrix(dat[, sample_cols]) # costruisce la matrice dei conteggi solo con quelle colonne
+rownames(counts) <- gene_ids # assegna ad ogni riga della matrice l'identificativo del gene 
+
+mode(counts) <- "integer" # gli elementi della matrice dei conteggi devono essere di tipo intero
+
+# Verifica le dimensioni della matrice
+dim(counts)
+```
+I nomi dei campioni:
+
+```{r}
+# Verifica i campioni
+sample_cols
+```
+## 1.3 Scaricamento e allineamento dei metadati
+
+In questa fase si procede al recupero e alla corretta associazione dei metadati relativi ai campioni di RNA-seq.
+Questo passaggio è fondamentale per disporre delle **informazioni descrittive** (ad es. condizioni sperimentali, gruppi di trattamento, informazioni sul campione) che saranno utilizzate per raggruppare e interpretare i dati di espressione.
+
+I nomi delle colonne indacano le informazioni disponibili relative ai campioni:
+
+```{r}
+# Scarica i metadati
+# Tramite la funzione getGEO() si scarica l'oggetto GSE contenente i metadati relativi ai campioni. 
+# Il dataset è memorizzato come un oggetto di classe ExpressionSet dal quale si estraggono i dati di annotazione (pData).
+
+gse <- getGEO(serie, GSEMatrix = TRUE)[[1]] # prendo il primo oggetto
+coldata <- pData(gse)
+
+# Visualizza i nomi di tutti i campi disponibili
+colnames(coldata)
+```
+Dai titoli ricaviamo la corrispondenza con i nomi dei campioni:
+
+```{r}
+# Verifica i titoli dei campioni
+coldata$title
+```
+Come si osserva, i titoli dei campioni contengono il nome campione tra parentesi quadre. Vengono quindi estratti i nomi dalle paratensi in modo da garantire una corrispondenza esatta con le intestazioni della matrice di conteggi:
+
+```{r}
+# Per uniformare i titoli dei metadati con i nomi dei campioni, estrae dai titoli ciò che è presente tra parentesi quadre
+sample_from_title <- str_extract(coldata$title, "(?<=\\[).+?(?=\\])")
+
+sample_from_title
+```
+Si passa alla creazione della mappatura **campione-accession**: si costruisce un vettore di mapping che associa i nomi dei campioni presenti nei dati di espressione agli accession GSM univoci (che identificano i campioni nei metadati), così da rinominare le colonne della matrice dei conteggi con gli identificativi ufficiali. Ciò consente di allineare in modo univoco i dati di espressione con i metadati.
+
+Viene effettuato un controllo per garantire che tutti i nomi dei campioni della matrice di conteggi siano presenti nella mappatura e verificato che l’ordine delle colonne della matrice e delle righe del dataframe dei metadati sia esattamente corrispondente, requisito essenziale per un’analisi differenziale corretta e per l’applicazione di modelli statistici.
+
+I metadati vengono riordinati per allinearsi esattamente con l’ordine dei campioni nella matrice di conteggi, per evitare disallineamenti tra dati di espressione e dati descrittivi.
+Nella tabella dei metadati ogni riga corrisponde a un campione, mentre le colonne contengono le diverse informazioni disponibili.
+
+```{r}
+# Costruisce una mappa associando ad agni nome campione (es. M_766_A) il suo accession GSM (metadati)
+map_names <- setNames(coldata$geo_accession, sample_from_title)
+
+# Verifica che tutti i nomi dei conteggi siano nella mappa
+stopifnot(all(sample_cols %in% names(map_names)))
+
+# Rinomina le colonne di counts con gli accession
+new_colnames <- map_names[sample_cols]
+colnames(counts) <- new_colnames
+
+# Riordina i metadati nello stesso ordine dei campioni nella matrice dei conteggi
+coldata <- coldata[new_colnames, , drop = FALSE]
+
+# Verifica che le colonne dei conteggi corrispondano alle righe dei metadati
+stopifnot(all(colnames(counts) == rownames(coldata)))
+```
+
+Per confermare la corretta assegnazione e sincronizzazione tra matrice dei conteggi e metadati, vengono visualizzati:
+
+- I primi campioni mappati: una tabella che mostra il nome originale (es. M_766_A) e il relativo accession GSM;
+- Un estratto dei metadati riordinati, comprendente gli accession GSM, i titoli e la sorgente biologica (source_name_ch1).
+
+```{r}
+# Mostra una mappa tra nomi originali e accession GSM
+head(data.frame(NomeCampione = sample_cols, AccessionGSM = new_colnames))
+```
+```{r}
+# Mostra un estratto dei metadati riordinati (prime colonne informative)
+head(coldata[, c("geo_accession", "title", "source_name_ch1")])
+```
+
+## 1.4 Creazione dell’oggetto SummarizedExperiment
+
+Successivamente all'allinemento dei metadati, si integra in un’unica struttura coerente e standardizzata l’intero dataset RNA-seq, utilizzando la classe **SummarizedExperiment**.
+
+L’oggetto SummarizedExperiment, visibile in basso, viene costruito specificando:
+
+- **assays = list(counts = counts)**: il cuore dell’oggetto è la matrice dei conteggi grezzi (raw counts), dove le righe rappresentano i geni e le colonne i campioni. Questa è l'informazione numerica su cui si baseranno le analisi di espressione differenziale.
+- **colData = coldata**: i metadati associati ai campioni organizzati in una tabella con righe corrispondenti ai campioni (cioè alle colonne della matrice dei conteggi) e colonne che descrivono le informazioni biologiche e tecniche necessarie per definire i gruppi sperimentali e costruire i modelli statistici. 
+- **rowData = DataFrame(GeneID = rownames(counts))**: vengono assegnati agli elementi di riga i rispettivi identificativi genici, assicurando che ogni conteggio possa essere tracciato al gene corrispondente.
+
+```{r}
+# Costruzione del SummarizedExperiment
+se <- SummarizedExperiment(
+  assays  = list(counts = counts),
+  colData = coldata,
+  rowData = DataFrame(GeneID = rownames(counts))
+)
+
+se
+```
+
+## 1.5 Filtro dei geni a bassa espressione
+
+In questa fase si esegue un filtro preliminare dei geni per **rimuovere quelli con espressione trascurabile** con l’obiettivo di migliorare la qualità statistica dell’analisi riducendo rumore tecnico e problemi di multiple testing.
+
+Il criterio di filtraggio utilizzato è la **media dei conteggi grezzi per gene** calcolata su tutti i campioni.
+
+I geni con una media **<10** vengono esclusi, poiché è improbabile che abbiano un’espressione biologicamente rilevante o che possano produrre stime statisticamente robuste.
+
+Su 16.282 geni iniziali, 5.994 superano la soglia e vengono mantenuti per le analisi successive, mentre 10.288 geni vengono scartati.
+
+```{r}
+# Crea un filtro per rimuovere geni con espressione media < 10
+filter <- rowMeans(assay(se)) >= 10
+table(filter)  # mostra quanti geni vengono mantenuti
+```
+```{r fig.width=6, fig.height=6}
+# Costruzione grafico a torta per mostrare la parcentuale di geni mantenuti e scartati
+# Conta i geni mantenuti e scartati
+gcounts <- table(filter)
+names(gcounts) <- c("Scartati", "Mantenuti")
+
+# Calcola percentuali
+percent <- round(100 * gcounts / sum(gcounts), 1)
+labels <- paste0(names(gcounts), "\n", percent, "%")
+
+# Grafico a torta
+pie(gcounts, labels = labels, col = c("red", "green"),
+    main = "Distribuzione dei geni dopo il filtro di espressione",
+    cex = 1.7)
+```
+
+L’oggetto risultante dell'applicazione del filtro è un nuovo SummarizedExperiment contenente **solo i geni ad espressione sufficiente**. L’integrità della struttura viene mantenuta: i metadati (colData) e le annotazioni dei geni (rowData) sono conservati e coerenti con i dati filtrati.
+
+```{r}
+# Applica il filtro
+filtered <- se[filter,]
+filtered  # oggetto filtrato
+```
+## 1.6 Visualizzazione dei dati grezzi
+
+In questa sezione si esegue una valutazione preliminare della qualità dei dati grezzi di espressione, prima di procedere con la normalizzazione e l’analisi differenziale. 
+
+I seguenti boxplot mostrano la distribuzione dei **log(counts)** per ciascun campione, con ordinamento basato sul **trattamento** (tezemetostat o veicolo).
+Viene utilizzata la funzione **log1p() (log(x + 1))** per stabilizzare la varianza e ridurre l'influenza dei valori estremi, mantenendo i dati grezzi.
+La colorazione in base al trattamento aiuta a visualizzare l'omogeneità intra-gruppo e le differenze inter-gruppo.
+
+Si osserva un numero consistente di outlier positivi, ovvero geni con espressione eccezionalmente elevata rispetto alla distribuzione centrale del campione. Questo comportamento è atteso nei dati RNA-seq, in quanto l’espressione genica è solitamente fortemente sbilanciata: pochi geni altamente espressi e una larga parte a bassa espressione. 
+Le mediane allineate suggeriscono l’assenza di bias sistematici tra i campioni, compatibile con una buona qualità dei dati pre-normalizzazione. Le altezze dei box sono simili tra i gruppi, il che indica una variabilità comparabile tra i campioni e nessuna anomalia evidente dovuta a problemi tecnici.
+
+I dati grezzi, sebbene non normalizzati, sono complessivamente bilanciati e non mostrano deviazioni evidenti tra i gruppi di trattamento.
+
+```{r}
+# Crea una palette di colori dedicata
+pal <- brewer.pal(8, "Set2")
+
+# Salva in una variabile il fattore trattamento
+trattamento <- colData(filtered)$`treatment:ch1`
+
+# Crea un ordine dei campioni basato sul trattamento
+ordine <- order(trattamento)
+
+# Applica l'ordine all'assay e ai metadati
+assay_ordinato <- assay(filtered)[, ordine]
+trattamento_ordinato <- trattamento[ordine]
+
+# Boxplot ordinato in base al trattamento
+boxplot(log1p(assay_ordinato),
+        col = pal[as.factor(trattamento_ordinato)],
+        las = 2,
+        main = "Distribuzione log(counts) ordinata per trattamento")
+
+# Legenda
+legend("topright",
+       legend = levels(as.factor(trattamento_ordinato)),
+       fill = pal,
+       title = "Treatment",
+       cex = 0.8)
+```
+
+Diversamente, **Relative Log Expression (RLE) plot** misura, per ciascun gene in ciascun campione, quanto l’espressione di quel gene si discosta dalla mediana dello stesso gene calcolata su tutti i campioni. In condizioni ideali, ovvero in assenza di effetti sistematici non biologici, i boxplot dovrebbero essere centrati attorno allo zero e presentare ampiezze simili.
+In questo caso, si osservano alcune deviazioni delle mediane in specifici campioni, suggerendo una possibile eterogeneità e la necessità di normalizzazione per correggere variazioni sistematiche non biologiche.
+
+```{r}
+# RLE plot
+plotRLE(assay(filtered), 
+        col = pal[as.factor(filtered$`treatment:ch1`)], 
+        outline = FALSE, 
+        las = 2,
+        main = "RLE plot")
+
+legend("topright",
+       legend = levels(as.factor(trattamento)),
+       fill = pal[1:length(levels(as.factor(trattamento)))],
+       title = "Trattamento",
+       cex = 0.8)
+```
+
+È stata effettuata un’analisi delle componenti principali (**PCA, Principal Component Analysis**) sui dati di espressione filtrati. La PCA è una tecnica di riduzione dimensionale che consente di rappresentare i campioni in uno spazio bidimensionale, massimizzando la varianza complessiva tra i profili di espressione genica.
+
+In questo caso, le prime due componenti principali spiegano circa il 58% della varianza totale. Si osserva una separazione non netta tra i campioni trattati con CART19-tazemetostat e quelli trattati con CART19-veicolo.
+
+Nella prossima sezione verrà effettuata la normalizzazione per migliorare la separazione tra i gruppi, riducendo l’impatto di variazioni tecniche residue.
+
+```{r}
+# PCA plot con colorazione per trattamento
+plotPCA(assay(filtered), 
+        col = pal[as.factor(filtered$`treatment:ch1`)],
+        main = "PCA - prime due componenti principali")
+
+legend("topright",
+       legend = levels(as.factor(trattamento)),
+       fill = pal[1:length(levels(as.factor(trattamento)))],
+       title = "Trattamento",
+       cex = 0.5)
+```
+
+## 1.7 Normalizzazione dei dati
+
+In questa sezione, al fine di ridurre le variazioni tecniche e rendere i dati di espressione genica comparabili tra i campioni, vengono effettuate e confrontate diverse strategie di normalizzazione.
+
+### 1.7.1 Normalizzazione dei dati con EDASeq
+
+In questa sottosezione sono stati applicati due metodi di normalizzazione utilizzando la funzione **betweenLaneNormalization** dal pacchetto EDASeq. In particolare:
+
+- **Upper-quartile normalization**: questo metodo corregge i dati facendo in modo che il valore al 75° percentile dei conteggi sia simile tra i campioni, aiutando a bilanciare differenze nelle dimensioni delle librerie e a ridurre l’impatto di valori molto alti.
+- **Full-quartile normalization**: è una tecnica che rende uguali le distribuzioni dei valori di espressione genica tra tutti i campioni, allineando i quantili delle distribuzioni. Utilizza l’intera distribuzione, rendendo la normalizzazione più uniforme, ma può essere più influenzata dai valori estremi.
+
+```{r}
+# Normalizzazione con EDASeq: Upper-quartile
+assay(filtered, "uq") <- betweenLaneNormalization(assay(filtered), which = "upper")
+```
+
+```{r}
+# Normalizzazione con EDASeq: Full-quartile
+assay(filtered, "fq") <- betweenLaneNormalization(assay(filtered), which = "full")
+```
+
+### 1.7.2 Normalizzazione dei dati con EdgeR
+
+Per eseguire due ulteriori normalizzazioni è stata utilizzata la libreria EdgeR:
+
+- **TMM (Trimmed Mean of M-values)**: calcola dei fattori per bilanciare le differenze tra librerie, ignorando i geni con variazioni molto forti. 
+- **RLE (Relative Log Expression)**: normalizza i dati confrontando l’espressione di ogni gene con un riferimento, di solito il campione medio, per correggere le differenze tra librerie.
+
+Successivamente, sono stati calcolati i valori **CPM** (Counts Per Million) normalizzati, che rappresentano il numero di conteggi normalizzati per milione di letture totali, essenziali per rendere i dati comparabili tra campioni di diverse dimensioni di libreria.
+
+```{r}
+# Normalizzazione edgeR: TMM 
+tmm_factors <- calcNormFactors(assay(filtered), method = "TMM")
+
+# Calcolo dati normalizzati CPM per TMM
+assay(filtered, "tmm") <- cpm(assay(filtered), lib.size = tmm_factors * colSums(assay(filtered)))
+```
+
+```{r}
+# Normalizzazione edgeR: RLE 
+rle_factors <- calcNormFactors(assay(filtered), method = "RLE")
+
+# Calcolo dati normalizzati CPM per RLE
+assay(filtered, "rle") <- cpm(assay(filtered), lib.size = rle_factors * colSums(assay(filtered)))
+```
+
+### 1.7.3 Confronto normalizzazioni
+
+Per scegliere la migliore normalizzazione, sono stati visualizzati gli RLE plot e i PCA plot per ciascuna normalizzazione.
+
+```{r}
+# Confronto RLE plots per tutte le normalizzazioni
+for (a in c("counts", "uq", "fq", "tmm", "rle")) {
+  plotRLE(assay(filtered, a),
+          col = pal[as.factor(filtered$`treatment:ch1`)],
+          las = 2, outline = FALSE, main = paste("RLE plot -", a))
+  
+  legend("topright",
+       legend = levels(as.factor(trattamento)),
+       fill = pal[1:length(levels(as.factor(trattamento)))],
+       title = "Trattamento",
+       cex = 0.5)
+}
+```
+
+```{r}
+# Confronto PCA plots per tutte le normalizzazioni
+for (a in c("counts", "uq", "fq", "tmm", "rle")) {
+  plotPCA(assay(filtered, a),
+          col = pal[as.factor(filtered$`treatment:ch1`)],
+          main = paste("PCA -", a))
+  
+  legend("topright",
+       legend = levels(as.factor(trattamento)),
+       fill = pal[1:length(levels(as.factor(trattamento)))],
+       title = "Trattamento",
+       cex = 0.5)
+}
+```
+
+L’ispezione visiva dei risultati ottenuti dai plot PCA suggerisce che la normalizzazione **Full-quartile** è la più adeguata nel separare i campioni in base al trattamento. Per questo motivo, le analisi successive verranno condotte utilizzando i dati normalizzati con questo approccio.
+
+Si osserva, inoltre, la presenza di un campione, **GSM8259456**, trattato con tazemetostat, che appare fortemente distaccato dagli altri campioni dello stesso gruppo nei plot PCA. Tale comportamento anomalo suggerisce che possa trattarsi di un outlier tecnico o biologico. Si è deciso quindi di creare un nuovo dataset, escludendo questo campione. Nei paragrafi successivi verranno analizzati **due dataset**, uno con il campione GSM8259456 e l'altro senza, al fine di valutare l’impatto della sua esclusione e determinare se debba essere mantenuto o rimosso dalle analisi finali.
+
+## 1.8 Creazione dataset senza il campione GSM8259456 e confronto PCA
+
+Per valutare l’impatto del campione **GSM8259456**, precedentemente identificato come potenziale outlier nei plot PCA, è stato costruito un nuovo dataset dal quale tale campione è stato escluso. La normalizzazione full-quartile è stata nuovamente eseguita sul dataset ridotto, al fine di verificare eventuali miglioramenti nella coerenza strutturale dei dati.
+
+I nuovi plot PCA evidenziano una maggiore **coerenza intra-gruppo**. In particolare, la visualizzazione con simboli distinti per ogni topo e colori differenziati per trattamento evidenzia con chiarezza la struttura del dataset: i campioni provenienti dallo stesso topo tendono a raggrupparsi tra loro, formando cluster compatti e coerenti. Fa eccezione il campione GSM8259456, che si colloca lontano dalle altre due repliche appartenenti allo stesso topo.
+
+```{r}
+# Rimozione GSM8259456 e normalizzazione
+filtered_noGSM <- filtered[, colnames(filtered) != "GSM8259456"]
+assay(filtered_noGSM, "fq_noGSM") <- betweenLaneNormalization(assay(filtered_noGSM), which = "full")
+```
+
+```{r}
+# PCA del dataset completo con simboli per topo
+plotPCA_mouse( # utilizza funzione documentata
+  expr_matrix = assay(filtered, "fq"),
+  sample_data = colData(filtered),
+  map_names = map_names,
+  title = "PCA dataset completo"
+)
+
+# PCA del dataset senza il campione 
+plotPCA_mouse(
+  expr_matrix = assay(filtered_noGSM, "fq_noGSM"),
+  sample_data = colData(filtered_noGSM),
+  map_names = map_names,
+  title = "PCA senza GSM8259456"
+)
+```
+
+
+# 2. Analisi differenziale con EdgeR
+
+In questa fase viene eseguita l'analisi dell’espressione differenziale su due dataset: uno **completo** e uno da cui è stato **rimosso il campione GSM8259456**.
+L’obiettivo è assicurarsi che le differenze osservate nei livelli di espressione genica tra i campioni siano dovute a variazioni biologiche reali, e non a fattori tecnici come, ad esempio, la profondità di sequenziamento.
+
+## 2.1 Preparazione dell'oggetto DGEList
+
+I dati RNA-seq, normalizzati utilizzando la normalizzazione Full-Quantile, sono stati caricati in due oggetti **DGEList**, uno con l’intero set di campioni (dge_full) e uno senza il campione GSM8259456 (dge_noGSM).
+Un oggetto DGEList è una struttura dati specifica di edgeR che contiene la matrice dei conteggi grezzi, le informazioni sui campioni e i fattori di normalizzazione, ed è il formato richiesto per effettuare l’analisi dell’espressione differenziale.
+
+Prime righe e colonne della matrice dei conteggi di dge_full:
+
+```{r}
+# Dataset completo
+
+# Creazione dell'oggetto DGEList utilizzando i dati di conteggio (counts) estratti dall’assay "fq" dell’oggetto SummarizedExperiment filtrato (filtered).
+# L’assay "fq" contiene i dati normalizzati tramite la normalizzazione Full-Quantile.
+# Le informazioni sui campioni (samples) sono ricavate dai metadati (colData).
+
+dge_full <- DGEList(counts = assay(filtered, "fq"), samples = colData(filtered))
+head(dge_full$counts[, 1:5])
+```
+
+Prime righe e colonne della matrice dei conteggi dge_noGSM:
+
+```{r}
+# Dataset senza il campione GSM8259456
+
+# Creazione di un oggetto DGEList con i dati normalizzati presenti nell’assay "fq_noGSM" e i metadati associati a "filtered_noGSM".
+
+dge_noGSM <- DGEList(counts = assay(filtered_noGSM, "fq_noGSM"), samples = colData(filtered_noGSM))
+head(dge_noGSM$counts[, 1:5])
+```
+
+Prime righe delle informazioni sui campioni del dataset completo:
+
+```{r}
+head(dge_full$samples[, 1:5])
+```
+Prime righe delle informazioni sui campioni del dataset senza il campione anomalo:
+
+```{r}
+head(dge_noGSM$samples[, 1:5])
+```
+
+## 2.2 Definizione del design matrix
+
+L'analisi differenziale è stata effettuata utilizzando **modelli lineari generalizzati** (GLM) implementati in edgeR, adeguati per dati di conteggio RNA-seq. Per l'applicazione dei GLM è stato necessario costruire una **design matrix**, ovvero una matrice binaria che codifica l’appartenenza di ciascun campione a un gruppo sperimentale. In questo caso, i campioni sono suddivisi in gruppi sulla base del **trattamento** (*treatment:ch1*), e tale informazione è stata pulita e standardizzata in una nuova colonna chiamata *'treatment'*.
+
+I trattamenti considerati sono:
+
+- **CART19.tazemetostat**: campioni trattati con cellule CAR-T combinate con l’inibitore dell’epigenetica tazemetostat.
+- **CART19.vehicle**: campioni trattati con CAR-T e solo veicolo (controllo).
+
+È stata creata una design matrix **senza termine di intercetta** (~ 0 + treatment) per poter confrontare direttamente ciascun gruppo senza che uno di essi venga utilizzato come riferimento implicito. Questo approccio consente di specificare in modo esplicito i contrasti desiderati nelle fasi successive. Inoltre, sono stati sostituiti eventuali caratteri speciali nei nomi dei livelli (come il simbolo "-") con punti ".", poiché nomi contenenti caratteri non sintatticamente validi possono causare errori nei contrasti.
+
+Questa procedura è stata eseguita sia per il dataset completo che per il subset da cui è stato escluso il campione GSM8259456.
+
+La design matrix del dataset completo:
+
+```{r}
+# Copia di 'treatment:ch1' in una colonna pulita
+colData(filtered)$treatment <- filtered$`treatment:ch1`
+colData(filtered_noGSM)$treatment <- filtered_noGSM$`treatment:ch1`
+
+# Creazione dei design matrix del datset completo senza intercetta in modo che ogni gruppo abbia una propria colonna
+data_full <- colData(filtered)
+design_full <- model.matrix(~ 0 + treatment, data = data_full)
+colnames(design_full) <- gsub("-", ".", colnames(design_full)) # R crea nomi con '-' che non sono sintatticamente validi per contrasts, quindi vengono sostituiti con '.'
+design_full  # verifica dei nomi delle colonne (utile per la creazione dei contrasti)
+```
+Design matrix del subset senza GSM8259456:
+
+```{r}
+# Per il subset senza GSM8259456
+data_noGSM <- colData(filtered_noGSM)
+design_noGSM <- model.matrix(~ 0 + treatment, data = data_noGSM)
+colnames(design_noGSM) <- gsub("-", ".", colnames(design_noGSM))
+design_noGSM  # verifica dei nomi delle colonne
+```
+Verifica del bilanciamento dei gruppi nel dataset completo:
+
+```{r}
+table(colData(filtered)$treatment)
+```
+Verifica del bilanciamento dei gruppi nel subset:
+
+```{r}
+table(colData(filtered_noGSM)$treatment)
+```
+Nel dataset completo, i campioni sono perfettamente **bilanciati** tra i due trattamenti, con 9 campioni ciascuno.
+Nel subset senza GSM8259456, si osserva una **lieve asimmetria** (non tale da compromettere l'analisi): il gruppo CART19-tazemetostat ha 8 campioni, mentre CART19-vehicle ne ha 9.
+    
+## 2.3 Stima della dispersione
+
+Per poter eseguire correttamente i test di espressione differenziale, è necessario stimare la **dispersione dei dati**, ovvero la variabilità aggiuntiva presente nei conteggi RNA-seq. In edgeR, la dispersione rappresenta la **variabilità biologica e tecnica residua nei dati RNA-seq**.
+
+La funzione **estimateDisp()** utilizza un modello lineare generalizzato (GLM) per stimare la dispersione genica, tenendo conto della design matrix definita in precedenza.
+La stima include:
+
+- **dispersione comune**: una stima globale condivisa da tutti i geni,
+- **dispersione trended**: dipendente dall'intensità di espressione,
+- **dispersione tagwise**: specifica per ciascun gene.
+
+È stata inoltre prodotta la **Biological Coefficient of Variation (BCV) plot**, che consente di valutare graficamente la relazione tra livello di espressione genica e dispersione stimata.
+
+La stima è stata condotta sia sul dataset completo, sia sul subset senza il campione GSM8259456, per valutare eventuali effetti di quel campione sulla variabilità biologica.
+
+```{r}
+# Stima della dispersione per il dataset completo
+dge_full <- estimateDisp(dge_full, design_full) # oggetto con dispersione stimata
+
+# Stima della dispersione per il subset senza il campione GSM8259456
+dge_noGSM <- estimateDisp(dge_noGSM, design_noGSM) # oggetto con dispersione stimata
+
+# Visualizzazione della dispersione stimata (BCV = sqrt(dispersion))
+# Il grafico mostra la relazione tra espressione genica e variabilità biologica
+plotBCV(dge_full, main = "BCV - Full dataset")
+
+# Verifica visiva dell’effetto della rimozione del campione GSM8259456 sulla dispersione stimata
+plotBCV(dge_noGSM, main = "BCV - Senza GSM8259456")
+```
+
+```{r}
+cat("Media della dispersione nel datset completo:", dge_full$common.dispersion)
+cat("Media della dispersione nel datset senza GSM8259456:", dge_noGSM$common.dispersion)
+```
+
+I grafici BCV mostrano il coefficiente di variazione biologico per ciascun gene in funzione della sua espressione media. La dispersione media comune è risultata **più bassa nel dataset senza GSM8259456** (**0.0189** contro **0.0238**), indicando che la rimozione di quel campione ha ridotto la variabilità, migliorando la qualità statistica del dataset. In particolare infatti una dispersione minore:
+
+- Aumenta la potenza statistica
+- Riduce i falsi negativi
+- Rende più affidabile la differential expression analysis
+
+## 2.4 Fit del modello lineare generalizzato (GLM) e test di espressione differenziale
+
+In questa fase è stato applicato un **modello lineare generalizzato (GLM)** per identificare i geni differenzialmente espressi tra i due gruppi sperimentali: CART19-tazemetostat e CART19-vehicle.
+
+Per prima cosa, è stato definito un **contrasto** tra i due trattamenti sulla base del design matrix, specificando la **sottrazione tra il gruppo trattato e il gruppo di controllo**. Il contrasto **Taz_vs_Veh** specifica l’ipotesi che **la media dei livelli di espressione genica nel gruppo trattato con CART19-tazemetostat differisca da quella del gruppo CART19-vehicle**. Questo confronto permette di identificare i geni la cui espressione è significativamente alterata dal trattamento farmacologico rispetto al controllo.
+
+Successivamente, è stato eseguito il **fitting** del modello (glmFit) su entrambi i dataset:
+
+- fit_full sul dataset completo
+- fit_noGSM sul dataset da cui è stato escluso il campione GSM8259456
+
+Infine, il **test di Likelihood Ratio Test (LRT)** (glmLRT) è stato applicato per ogni contrasto, con l’obiettivo di identificare i geni la cui espressione differisce significativamente tra i due gruppi. I risultati ordinati per significatività statistica sono stati ottenuti tramite **topTags()**.
+
+```{r}
+# Definizione dei contrasts utilizzando i nomi delle colonne della design matrix
+# Serve a definire l'ipotesi da testare: se la differenza media di espressione genica tra i due gruppi è significativa
+cont_full <- makeContrasts(
+  Taz_vs_Veh = treatmentCART19.tazemetostat - treatmentCART19.vehicle,
+  levels = design_full
+)
+
+# Per il subset i nomi dei gruppi sono identici -> viene utilizzato lo stesso contrast
+cont_noGSM <- makeContrasts(
+  Taz_vs_Veh = treatmentCART19.tazemetostat - treatmentCART19.vehicle,
+  levels = design_noGSM
+)
+
+# Analisi della Differential Expression – Dataset Completo
+
+# Fit del GLM: costruisce il modello lineare per ciascun gene usando i dati di espressione normalizzati e la design matrix
+fit_full <- glmFit(dge_full, design_full)
+
+# Likelihood Ratio Test: esegue un test per ogni gene per verificare se la differenza di espressione è statisticamente significativa
+lrt_full <- glmLRT(fit_full, contrast = cont_full[,"Taz_vs_Veh"])
+
+# Ottiene tutti i risultati con logFC, p-value, FDR, etc., ordinati per significatività
+top_full <- topTags(lrt_full, n = Inf)$table
+
+# Analisi della Differential Expression – Dataset senza GSM8259456
+
+# Fit del GLM
+fit_noGSM <- glmFit(dge_noGSM, design_noGSM)
+
+# Likelihood Ratio Test
+lrt_noGSM <- glmLRT(fit_noGSM, contrast = cont_noGSM[,"Taz_vs_Veh"])
+
+# Ottiene i risultati
+top_noGSM <- topTags(lrt_noGSM, n = Inf)$table
+```
+
+### 2.4.1 Geni significativamente differenziati
+
+Le prime righe della tabella **topTags** riportano i geni maggiormente differenziati tra i due trattamenti (CART19-tazemetostat vs CART19-vehicle), ordinati per significatività statistica. Le colonne includono il log fold change (**logFC**), il valore p del test (**PValue**), e il valore di **FDR** (False Discovery Rate), che corregge per il testing multiplo.
+
+Sono visualizzati i primi geni più significativamente differenziati nel caso di:
+
+**1)** Dataset con tutti i campioni
+
+```{r}
+head(top_full)
+```
+
+**2)** Dataset senza il campione GSM8259456
+```{r}
+head(top_noGSM)
+```
+
+Le **heatmap** mostrano un chiaro pattern di espressione differenziale tra i due gruppi di trattamento. I geni sono raggruppati in base a somiglianza di profilo di espressione (clustering gerarchico), evidenziando sottogruppi distinti. I campioni trattati con tazemetostat (azzurro) mostrano un pattern opposto a quelli con veicolo (rosa), suggerendo che il trattamento ha un effetto globale sull'espressione genica. Fa eccezione il campione GSM8259456 che presenta un profilo di espressione marcatamente differente rispetto agli altri campioni dello stesso gruppo.
+
+```{r}
+# Plot heatmap dataset completo
+# Selezione dei DEG significativi
+deg_genes <- rownames(top_full[top_full$FDR < 0.05, ])
+
+# Calcolo logCPM per questi geni
+logCPM <- cpm(dge_full, log = TRUE)
+
+# Subset solo dei DEG
+logCPM_deg <- logCPM[deg_genes, ]
+
+# Annotazioni dei campioni 
+annotation_col <- as.data.frame(colData(filtered)[, "treatment", drop = FALSE])
+
+# Heatmap
+pheatmap(logCPM_deg,
+         annotation_col = annotation_col,
+         show_rownames = FALSE,
+         scale = "row",  # centra e scala ogni gene
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         main = "Heatmap dei DEG - Dataset completo")
+```
+
+```{r}
+# Heatmap dataset senza il campione
+deg_genes_noGSM <- rownames(top_noGSM[top_noGSM$FDR < 0.05,])
+logCPM_noGSM <- cpm(dge_noGSM, log = TRUE)
+logCPM_deg_noGSM <- logCPM_noGSM[deg_genes_noGSM, ]
+annotation_col_noGSM <- as.data.frame(colData(filtered_noGSM)[, "treatment", drop = FALSE])
+
+pheatmap(logCPM_deg_noGSM,
+         annotation_col = annotation_col_noGSM,
+         show_rownames = FALSE,
+         scale = "row",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         main = "Heatmap dei DEG - Dataset senza GSM8259456")
+```
+
+Impostando una soglia **FDR <0.05** è possibile identificare i geni differenzialmente espressi, il cui numero è un indicatore diretto della risposta biologica al trattamento. La rimozione del campione GSM8259456 permette di verificare se questo influisce sostanzialmente sul numero di geni DE, infatti una variazione marcata del numero di DEG potrebbe indicare che quel campione agisce da outlier o introduce variabilità non biologica.
+
+L’analisi della differential expression ha individuato **505** geni significativamente differenziati (FDR < 0.05) nel dataset completo e **729** geni nel dataset da cui è stato rimosso il campione GSM8259456.
+Questo suggerisce che la **rimozione del campione ha aumentato la sensibilità dell’analisi**, riducendo la variabilità introdotta da un outlier o campione atipico.
+
+```{r}
+cat("Numero di geni significativamente differenziati - Dataset Completo:",sum(top_full$FDR < 0.05))
+cat("Numero di geni significativamente differenziati - Dataset senza GSM8259456:",sum(top_noGSM$FDR < 0.05))
+```
+Per valutare la significatività globale dell’analisi, è stata esaminata la distribuzione dei p-value ottenuti dal test LRT. Come atteso, in entrambi i dataset si osserva un **accumulo di p-value bassi** (vicini a zero), molto più marcato di quanto ci si aspetterebbe in una distribuzione uniforme casuale. Questo indica la presenza di numerosi geni realmente differenzialmente espressi, e non solo variabilità dovuta al rumore statistico.
+Dopo il picco iniziale, la distribuzione tende a uniformarsi: i geni non differenzialmente espressi mostrano p-value distribuiti uniformemente fra 0 e 1.
+Dopo la rimozione del campione GSM8259456, il picco di p-value bassi diventa ancora più pronunciato, mentre la distribuzione dei p-value più alti appare leggermente più uniforme (coda più piatta). Questo suggerisce che il rumore introdotto da GSM8259456 mascherava in parte i segnali biologici reali.
+
+```{r fig.width=12, fig.height=6}
+# Istogramma dei p-value
+par(mfrow = c(1, 2))
+
+hist(top_full$PValue, breaks = 30,
+     main = "Distribuzione P-value - Dataset completo",
+     col = 'lightblue',
+     xlab = "P-value")
+
+hist(top_noGSM$PValue, breaks = 30,
+     main = "Distribuzione P-value - Senza GSM8259456",
+     col = 'lightblue',
+     xlab = "P-value")
+```
+
+Le **distribuzioni dei logFC** offrono una panoramica dell’ampiezza degli effetti di espressione genica osservati tra le condizioni sperimentali. 
+
+Entrambi gli istogrammi mostrano una **distribuzione simmetrica e centrata intorno allo zero**, con un picco molto pronunciato in corrispondenza di logFC = 0. Questo indica che la maggior parte dei geni non presenta differenze di espressione significative tra i due gruppi sperimentali (CART19-tazemetostat vs CART19-vehicle). 
+
+Tuttavia, l’esclusione del campione GSM8259456 ha determinato una leggera riduzione dei valori estremi di logFC, suggerendo che il campione potrebbe aver introdotto variazione non biologica.
+
+```{r fig.width=12, fig.height=6}
+# Plot istogrammi
+par(mfrow = c(1, 2))
+hist(top_full$logFC, main = "Distribuzione logFC - Dataset completo", xlab = "logFC", col = 'lightgreen')
+hist(top_noGSM$logFC, main = "Distribuzione logFC - Senza GSM8259456", xlab = "logFC", col = 'lightgreen')
+```
+
+### 2.4.2 Rappresentazione grafica dell’espressione differenziale
+
+Per visualizzare e interpretare i risultati dell’analisi di espressione differenziale, sono stati prodotti due tipologie di grafici diagnostici: **Volcano plot** e **MA-plot**, sia per il dataset completo che per il dataset senza il campione GSM8259456.
+
+Il **Volcano plot** combina due dimensioni dell’analisi: la significatività statistica (p-value) e la magnitudo della variazione (logFC). Questo tipo di visualizzazione consente di identificare rapidamente i **geni più rilevanti**, ovvero quelli significativamente regolati (**FDR ≤ 0.05**) e con variazione di espressione biologicamente rilevante (**|log₂FC| ≥ 1**). I geni up-regolati sono evidenziati in rosso, quelli down-regolati in blu, mentre i non significativi sono in grigio.
+
+```{r fig.width=12, fig.height=6}
+par(mfrow = c(1, 2))
+
+volcano_plot(top_full, "Volcano - Dataset completo")
+volcano_plot(top_noGSM, "Volcano - Dataset completo")
+```
+Applicando i criteri di significatività statistica (FDR ≤ 0.05) e rilevanza biologica (|log₂FC| ≥ 1), si osserva che dopo l'esclusione del campione GSM8259456, il numero di geni regolati aumenta, con 18 up-regolati e 11 down-regolati (contro i 16 e gli 8 del dataset completo).
+La rimozione del campione ha permesso di rilevare più geni con variazioni di espressione consistenti tra i due trattamenti (CART19+tazemetostat vs CART19+vehicle).
+
+```{r}
+# Criterio di significatività
+isSig_full <- top_full$FDR <= 0.05 & abs(top_full$logFC) >= 1
+isSig_noGSM <- top_noGSM$FDR <= 0.05 & abs(top_noGSM$logFC) >= 1
+
+# Geni up e down - dataset completo
+up_full_genes <- rownames(top_full)[isSig_full & top_full$logFC >= 1]
+down_full_genes <- rownames(top_full)[isSig_full & top_full$logFC <= -1]
+
+# Geni up e down - senza GSM8259456
+up_noGSM_genes <- rownames(top_noGSM)[isSig_noGSM & top_noGSM$logFC >= 1]
+down_noGSM_genes <- rownames(top_noGSM)[isSig_noGSM & top_noGSM$logFC <= -1]
+```
+
+Numero di geni up-regolati nel Dataset completo:
+```{r}
+length(up_full_genes)
+```
+Numero di geni down-regolati nel Dataset completo:
+```{r}
+length(down_full_genes)
+```
+Numero di geni up-regolati nel Dataset senza GSM8259456:
+```{r}
+length(up_noGSM_genes)
+```
+Numero di geni down-regolati nel Dataset senza GSM8259456:
+```{r}
+length(down_noGSM_genes)
+```
+Gli **MA-plot**, mettono in relazione il livello medio di espressione genica (A) con la variazione di espressione (M, ovvero logFC). I due grafici risulatano essere molto simili tra loro, ma nel dataset senza il campione anomalo si osserva un numero superiore di DEG.
+
+Si specifica che la differenza tra il numero di geni up-regolati e down-regolati che si osserva tra i Volcano plot e gli MA plot è dovuta al fatto che nel Volcano plot, sono stati evidenziati i geni significativi secondo due soglie contemporanee:
+
+- FDR ≤ 0.05 (significatività statistica)
+- |logFC| ≥ 1 (significatività biologica)
+
+Negli MA plot sono di default evidenziati tutti i geni FDR ≤ 0.05, indipendentemente dal valore di logFC (quindi anche logFC modesti, ad esempio 0.5 o −0.6, ma con FDR basso, vengono marcati come “Up” o “Down”).
+
+```{r fig.width=12, fig.height=6}
+par(mfrow = c(1, 2))
+
+# MA-plot per Full Dataset
+plotMD(lrt_full, main = "MA-plot - Full Dataset")
+
+# MA-plot per subset
+plotMD(lrt_noGSM, main = "MA-plot - Senza GSM8259456")
+```
+
+Alla luce di tutte le osservazioni finora fatte, **si decide di procedere con l'analisi funzionale sul dataset senza GSM8259456**, reputando questo campione un **outlier** in grado di influenzare l’analisi.
+
+# 3. Analisi funzionale sul dataset SENZA GSM8259456
+
+Dopo l’identificazione dei geni differenzialmente espressi (DEG) escludendo il campione GSM8259456 si procede con un’**analisi funzionale**. L’obiettivo è interpretare i DEG in un contesto biologico, esplorando i processi e i pathway coinvolti. A tal fine vengono impiegati approcci di arricchimento tramite **ClusterProfiler**.
+
+Per rafforzare l’affidabilità dell’analisi funzionale, è stato effettuato un confronto tra due strategie di selezione dei geni:
+
+- **DEG stringenti**: **FDR ≤ 0.05 e |log₂FC| ≥ 1**, che rappresentano geni con variazioni biologicamente rilevanti.
+- **DEG lassi**: **FDR ≤ 0.05** senza soglia sul logFC, per includere anche variazioni più sottili.
+
+## 3.1 Selezione dei geni differenzialmente espressi (DEG) e conversione in ENTREZ ID
+
+In questa sezione, vengono selezionati i geni differenzialmente espressi (DEG) ottenuti dall'analisi statistica del dataset privo del campione GSM8259456.
+
+Sono stati definiti due set distinti di geni significativi, con l’obiettivo di confrontare approcci stringenti e più inclusivi all’analisi funzionale:
+
+- **Set stringente**: comprende i geni con una False Discovery Rate (FDR) ≤ 0.05 e una variazione di espressione di rilievo biologico (|logFC| ≥ 1). Questi geni sono quelli che mostrano le **modifiche di espressione più marcate e affidabili**.
+- **Set lasco**: include tutti i geni con FDR ≤ 0.05, indipendentemente dall’ampiezza della variazione (logFC). Questo approccio più permissivo consente di individuare **pathway e GO term potenzialmente rilevanti che coinvolgono anche geni con modifiche di espressione moderate**.
+
+Entrambi i set sono stati ordinati per **FDR crescente**, in modo da dare priorità ai geni con la significatività statistica più elevata nelle successive analisi di arricchimento.
+
+```{r}
+# DEG stringenti (FDR <= 0.05 & |logFC| >= 1)
+deg_strict <- top_noGSM[isSig_noGSM, ] %>% arrange(FDR)
+DEGenes_strict <- rownames(deg_strict)
+
+# DEG lassi (solo FDR <= 0.05)
+deg_loose <- top_noGSM[top_noGSM$FDR <= 0.05, ] %>% arrange(FDR)
+DEGenes_loose <- rownames(deg_loose)
+
+cat("Numero di DEG nel Set stringente:", length(DEGenes_strict))
+cat("Numero di DEG nel Set lasco:", length(DEGenes_loose))
+```
+Di seguito sono riportati i **DEG del set stringente**.
+
+Tra questi, diversi geni sono noti per essere stimolati dall’**interferone** (ISG). Quando cellule immunitarie o cellule tumorali vengono stimolate da trattamenti specifici, producono interferoni: questi attivano la trascrizione di ISG, potenziano l'attività dei linfociti T e rendono le cellule tumorali più vulnerabili al sistema immunitario. Si tratta dunque di geni coerenti con la risposta immunitaria antitumorale indotta dal trattamento descritto nell’articolo. In particolare:
+
+- **IFI27, IFI44, IFI44L, IFITM1**: geni classicamente attivati in risposta a interferone di tipo I e II. La loro espressione elevata è compatibile con l’attivazione immunitaria indotta dalla combinazione terapeutica descritta nello studio.
+- **USP18**: questo gene regola negativamente la via JAK-STAT, che trasmette il segnale dell’interferone. La sua espressione aumentata è un segno tipico di una forte attivazione interferonica.
+- **TLR7**: recettore dell’immunità innata che attiva la produzione di interferoni. La sua presenza suggerisce un ruolo nell’amplificazione della risposta immunitaria antitumorale.
+
+Oltre agli ISG, vi sono anche geni legati alla risposta a **stress cellulare**:
+
+- **IER3**: coinvolto in risposte rapide a stimoli infiammatori o stress, potrebbe riflettere uno stato di attivazione o danneggiamento delle cellule tumorali.
+- **HSPA1A**: chaperone tipicamente indotto da stress o danno cellulare.
+- **JUN ed EGR1**: fattori trascrizionali attivati in contesti di proliferazione, infiammazione o apoptosi, che possono essere coinvolti nei cambiamenti trascrizionali indotti dal trattamento.
+
+
+```{r}
+# Conversione da ENSEMBL a SYMBOL
+ens_ids <- unique(c(DEGenes_strict))
+
+geneinfo <- bitr(
+  ens_ids,
+  fromType = "ENSEMBL",
+  toType = c("SYMBOL","ENTREZID"),
+  OrgDb = org.Hs.eg.db
+)
+
+geneinfo
+```
+
+Per eseguire le analisi funzionali (come l’arricchimento di pathway), è necessario utilizzare **identificatori genetici compatibili** con i database biologici di riferimento. 
+Si prosegue quindi alla **conversione dei risultati**, che sono in formato ENSEMBL, in **ENTREZ ID**, che è il formato accettato da strumenti come clusterProfiler e g:Profiler. 
+Vengono convertiti separatamente i geni appartenenti ai due insiemi (criterio stringente e lasso), così da poter eseguire confronti paralleli nei successivi passi di arricchimento.
+
+```{r}
+# Conversione ENSEMBL -> ENTREZ per entrambi i set
+DEGenes_strict_entrez <- bitr(DEGenes_strict, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+DEGenes_loose_entrez  <- bitr(DEGenes_loose,  fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+```
+
+Viene effettuato quindi un controllo per verificare il numero delle conversioni andate a buon fine:
+
+```{r}
+cat("Dei", length(DEGenes_strict), "DEG nel Set stringente,", nrow(DEGenes_strict_entrez), "sono stati convertiti in ENTREZID")
+cat("Dei", length(DEGenes_loose), "DEG nel Set lasco,", nrow(DEGenes_loose_entrez), "sono stati convertiti in ENTREZID")
+```
+È stato osservato che non tutti gli ENSEMBL ID sono stati convertiti correttamente in ENTREZ ID. Questo comportamento è atteso ed è dovuto a diversi fattori:
+
+- Alcuni ID ENSEMBL potrebbero corrispondere a pseudogeni, trascritti non codificanti, o entità genomiche senza una corrispondenza univoca in ENTREZ.
+- Le differenze tra versioni di database (es. ENSEMBL vs. org.Hs.eg.db) possono generare mancate corrispondenze.
+
+Nonostante ciò, la maggior parte dei DEG è stata mappata con successo, permettendo di proseguire con l’analisi funzionale. 
+
+## 3.2 Analisi di arricchimento GO con ClusterProfiler
+
+L’analisi di arricchimento GO consente di individuare i **processi biologici (BP)**, le **funzioni molecolari (MF)** e le **componenti cellulari (CC)** che risultano sovra-rappresentate tra i geni differenzialmente espressi (DEG).
+Questa analisi viene eseguita separatamente per i due insiemi definiti in precedenza: Set stringente e Set lasco, per esplorare le differenze funzionali tra approcci selettivi e inclusivi.
+Per eseguire l’arricchimento, è stato utilizzato il pacchetto clusterProfiler.
+
+```{r}
+# GO ENRICHMENT SEPARATO PER OGNI DOMINIO
+
+# GO - Set STRINGENTE
+go_strict_BP <- enrichGO(gene          = DEGenes_strict_entrez$ENTREZID,
+                         OrgDb         = org.Hs.eg.db,
+                         keyType       = "ENTREZID",
+                         ont           = "BP",              # Biological Process
+                         pAdjustMethod = "BH",
+                         pvalueCutoff  = 0.05,
+                         qvalueCutoff  = 0.05)
+
+go_strict_MF <- enrichGO(gene          = DEGenes_strict_entrez$ENTREZID,
+                         OrgDb         = org.Hs.eg.db,
+                         keyType       = "ENTREZID",
+                         ont           = "MF",              # Molecular Function
+                         pAdjustMethod = "BH",
+                         pvalueCutoff  = 0.05,
+                         qvalueCutoff  = 0.05)
+
+go_strict_CC <- enrichGO(gene          = DEGenes_strict_entrez$ENTREZID,
+                         OrgDb         = org.Hs.eg.db,
+                         keyType       = "ENTREZID",
+                         ont           = "CC",              # Cellular Component
+                         pAdjustMethod = "BH",
+                         pvalueCutoff  = 0.05,
+                         qvalueCutoff  = 0.05)
+
+
+# GO - Set LASSO
+go_loose_BP <- enrichGO(gene          = DEGenes_loose_entrez$ENTREZID,
+                        OrgDb         = org.Hs.eg.db,
+                        keyType       = "ENTREZID",
+                        ont           = "BP",
+                        pAdjustMethod = "BH",
+                        pvalueCutoff  = 0.05,
+                        qvalueCutoff  = 0.05)
+
+go_loose_MF <- enrichGO(gene          = DEGenes_loose_entrez$ENTREZID,
+                        OrgDb         = org.Hs.eg.db,
+                        keyType       = "ENTREZID",
+                        ont           = "MF",
+                        pAdjustMethod = "BH",
+                        pvalueCutoff  = 0.05,
+                        qvalueCutoff  = 0.05)
+
+go_loose_CC <- enrichGO(gene          = DEGenes_loose_entrez$ENTREZID,
+                        OrgDb         = org.Hs.eg.db,
+                        keyType       = "ENTREZID",
+                        ont           = "CC",
+                        pAdjustMethod = "BH",
+                        pvalueCutoff  = 0.05,
+                        qvalueCutoff  = 0.05)
+```
+
+#### **Dotplot categorie GO:BP**
+
+Questi grafici GO BP mostrano l'arricchimento di percorsi biologici nei due set di dati. 
+
+Il Set Stringente identifica chiaramente una forte arricchimento di processi legati alla "**risposta al virus**" e all'"**interferone**", indicando un'attivazione robusta della risposta immunitaria innata, coerente con l'articolo in esame. Il Set Lasco rivela anche arricchimenti in processi più grandi come "**regolazione positiva della risposta immunitaria**" e "**positive regulation of T cell activation**", che è coerente con il disegno sperimentale e i risultati dell’articolo, che mirano proprio a potenziare l’attivazione e l’efficacia delle T cells contro il tumore.
+
+```{r fig.width=14, fig.height=6}
+# DOTPLOT categorie BP
+p1 <- dotplot(go_strict_BP, showCategory = 10) + ggtitle("GO BP - Set Stringente")
+p2 <- dotplot(go_loose_BP, showCategory = 10) + ggtitle("GO BP - Set Lasco")
+
+p1+p2
+```
+
+#### **Dotplot categorie GO:MF**
+
+In anticipo, si mostra che il numero di categorie MF significative per il set stringente è nullo. 
+
+```{r}
+# Filtra termini MF significativi (p.adjust <= 0.05)
+sig_MF_terms <- go_strict_MF@result[go_strict_MF@result$p.adjust <= 0.05, ]
+
+# Conta quanti sono
+num_sig_MF <- nrow(sig_MF_terms)
+
+# Stampa il risultato
+cat("Numero di categorie MF significative (p.adjust <= 0.05):", num_sig_MF, "\n")
+```
+Di conseguenza verrà mostrato un unico dotplot relativo alle categorie MF del set lasco.
+
+Tra le funzioni molecolari arricchite "**structural constituent of chromatin**" e "**protein heterodimerization activity**" sono strettamente coerenti con la biologia dell’esperimento: l'enzima EZH2, della cui inibizione si occupa il farmaco tazemetostat, agisce tramite il complesso PRC2 per modificare la cromatina ed è noto che funzioni attraverso eterodimerizzazioni/allestimento di complessi proteici.
+
+```{r}
+# DOTPLOT categorie MF
+dotplot(go_loose_MF, showCategory = 10) + ggtitle("GO MF - Set Lasco")
+```
+
+#### **Dotplot categorie GO:CC**
+
+Le categorie "**nucleosome**", “**protein‑DNA complex**”, “**external side of plasma membrane**”, “**MHC protein complex**”, e quelle relative alle vescicole endocitiche/fagocitiche, arrichite nel set Lasco, sono coerenti e biologicamente rilevanti nel contesto di GSE267074. EZH2 regola l’espressione genica attraverso modifiche alla cromatina, e la sua inibizione promuove l’immunogenicità tumorale aumentando l’esposizione di antigeni e MHC sulla membrana plasmatica, coinvolgendo anche vescicole endocitiche e fagocitiche nella risposta immunitaria potenziata dalle CAR‑T.
+
+```{r fig.width=14, fig.height=6}
+# DOTPLOT categorie CC
+p1 <- dotplot(go_strict_CC, showCategory = 10) + ggtitle("GO CC - Set Stringente")
+p2 <- dotplot(go_loose_CC,  showCategory = 10) + ggtitle("GO CC - Set Lasco")
+
+p1 + p2
+```
+
+#### **Enrichment Map categorie GO:BP**
+
+Nel Set Stringente, la "**response to virus**" e i processi legati all'"**interferone**" emergono come centrali e altamente significativi, indicando una forte attivazione della risposta immunitaria antivirale. 
+La rete relativa al Set Lasco è meno coesa, e tra i pathway centrali compare anche "**T cell activation**".
+
+```{r fig.width=12, fig.height=6}
+# Calcola la similarità semantica per l'oggetto di arricchimento
+go_strict_BP <- pairwise_termsim(go_strict_BP)
+go_loose_BP  <- pairwise_termsim(go_loose_BP)
+
+# Genera gli emapplot
+p1 <- emapplot(go_strict_BP, showCategory = 10) + ggtitle("GO BP - Set Stringente")
+p2 <- emapplot(go_loose_BP, showCategory = 10) + ggtitle("GO BP - Set Lasco")
+p1+p2
+```
+
+#### **Enrichment Map categorie GO:MF**
+
+Le funzioni molecolari sono poche e relativamente isolate. Spiccano "**protein heterodimerization activity**" e ""**structuralc constituent of chromatin**"" relazionate fra loro.
+
+```{r}
+go_loose_MF  <- pairwise_termsim(go_loose_MF)
+
+# Genera gli emapplot
+p2 <- emapplot(go_loose_MF, showCategory = 10) + ggtitle("GO MF - Set Lasco")
+p2
+```
+
+#### **Enrichment Map categorie GO:CC**
+
+```{r fig.width=12, fig.height=6}
+go_strict_CC <- pairwise_termsim(go_strict_CC)
+go_loose_CC  <- pairwise_termsim(go_loose_CC)
+
+p1 <- emapplot(go_strict_CC, showCategory = 10) + ggtitle("GO CC - Set Stringente")
+p2 <- emapplot(go_loose_CC, showCategory = 10) + ggtitle("GO CC - Set Lasco")
+p1+p2
+```
+
+#### **Category Network Plot per le categorie GO:BP**
+
+Dai Cnet plot si osserva che ancora una volta i processi biologici più arricchiti riguardano la risposta immunitaria e l'interferone. I geni che arricchiscono queste categorie sono in numero maggiore nel set lasco, in accordo con il fatto che il suddetto set ha un numero molto maggiore di geni al suo interno.
+
+```{r}
+# Per entrambi gli insiemi di geni DE crea un vettore dei logFC associati a ID Entrez
+logfc_strict <- prepare_logfc(DEGenes_strict, top_noGSM)
+logfc_loose  <- prepare_logfc(DEGenes_loose,  top_noGSM)
+```
+
+```{r fig.width=12, fig.height=6}
+# BP
+p1 <- plot_cnet(go_strict_BP, logfc_strict, "Cnetplot – BP – Set Stringente")
+p2 <- plot_cnet(go_loose_BP,  logfc_loose,  "Cnetplot – BP – Set Lasco")
+p1+p2
+```
+
+#### **Category Network Plot per le categorie GO:MF**
+
+Le funzioni molecolari maggiormente arricchite riguardano l’eterodimerizzazione proteica e la struttura della cromatina, con un numero consistente di geni condivisi tra le due categorie, suggerendo un’interazione funzionale tra organizzazione della cromatina e complessi proteici regolatori.
+
+```{r}
+# MF
+p2 <- plot_cnet(go_loose_MF,  logfc_loose,  "Cnetplot – MF – Set Lasco")
+p2
+```
+
+#### **Category Network Plot per le categorie GO:CC**
+
+Le categorie inerenti alle vescicole, al nucleosoma, al complesso proteina-DNA si confermano essere quelle maggiormente arricchite.
+
+```{r fig.width=12, fig.height=6}
+# CC
+p1 <- plot_cnet(go_strict_CC, logfc_strict, "Cnetplot – CC – Set Stringente")
+p2 <- plot_cnet(go_loose_CC,  logfc_loose,  "Cnetplot – CC – Set Lasco")
+p1+p2
+```
+
+
+## 3.3 Analisi di arricchimento KEGG con ClusterProfiler
+
+L’analisi di arricchimento è proseguita con l'identificazione di **pathway KEGG** significativamente arricchiti nei due insiemi di geni differenzialmente espressi. I pathway KEGG (Kyoto Encyclopedia of Genes and Genomes) rappresentano **reti biologiche di reazioni metaboliche**, **processi cellulari** e **vie di segnalazione**, e forniscono un contesto funzionale utile per interpretare i cambiamenti trascrizionali osservati nei dataset di espressione genica.
+
+L'analisi è stata condotta separatamente sui due set al fine di evidenziare:
+
+- **Pathway condivisi tra i due approcci**, potenzialmente più robusti e biologicamente rilevanti;
+- **Pathway aggiuntivi rilevati nel set lasco**, che potrebbero fornire spunti su meccanismi sottili ma rilevanti.
+
+Il **set stringente** consente di evidenziare eventi trascrizionali dominanti e altamente significativi, privilegiando la **specificità e l’affidabilità**. Al contrario, l’approccio lasco favorisce la **sensibilità**, permettendo di cogliere pathway più articolati e debolmente modulati, ampliando la copertura funzionale e rivelando potenziali interazioni biologiche complesse.
+
+```{r}
+# Analisi di arricchimento KEGG - Set stringente
+enrich_kegg_strict <- enrichKEGG(
+  gene = DEGenes_strict_entrez$ENTREZID,
+  organism = "hsa",
+  pvalueCutoff = 0.05
+)
+
+# Analisi di arricchimento KEGG - Set lasco
+enrich_kegg_loose <- enrichKEGG(
+  gene = DEGenes_loose_entrez$ENTREZID,
+  organism = "hsa",
+  pvalueCutoff = 0.05
+)
+```
+
+### 3.3.1 Dotplot dei Pathway KEGG Arricchiti
+
+Per facilitare l’interpretazione dell’arricchimento KEGG nei due insiemi di geni differenzialmente espressi (set stringente e set lasco), è stato dapprima impiegato il dotplot, allo scopo di rappresentare in modo sintetico ed efficace i pathway significativamente associati ai geni differenzialmente espressi tenendo conto anche della loro numerosità. 
+
+Il confronto tra i due insiemi evidenzia differenze marcate in termini di numerosità, varietà e significatività dei pathway arricchiti.
+
+- Nel set stringente, l’arricchimento è focalizzato su un numero limitato di pathway, con una netta predominanza del pathway del morbillo (GeneRatio ~0.42, p.adjust ~0.01), affiancato da vie legate a risposte immunitarie e segnali ormonali.
+- Nel set lasco, invece, emerge una maggiore eterogeneità funzionale, tra cui processi infiammatori, immunologici e oncogeni (es. lupus eritematoso sistemico). Sebbene il GeneRatio risulti più contenuto (~0.02–0.08), il numero assoluto di geni coinvolti è maggiore (fino a 20), e la significatività statistica rimane solida.
+
+In entrambi i grafici possono essere evidenziati pathway riconducibili alla materia in esame: "**B cell receptor signaling pathway**", "**Toll like receptor signaling pathway**" e altri che verranno approfonditi in seguito.
+
+```{r fig.width=14, fig.height=6}
+p1 <- dotplot(enrich_kegg_strict, showCategory = 15, title = "KEGG Enrichment - Set Stringente")
+p2 <- dotplot(enrich_kegg_loose, showCategory = 15, title = "KEGG Enrichment - Set Lasco")
+p1+p2
+```
+
+### 3.3.2 Mappa di similarità tra pathway 
+
+Per esplorare le relazioni semantico-funzionali tra i pathway KEGG arricchiti, è stata utilizzata la rappresentazione tramite Enrichment Map, basata sulla similarità tra termini. 
+
+Nel Set Stringente, il pathway del morbillo (Measles) emerge come nodo centrale ma relativamente isolato. Si osservano molte interconnessioni tra pathway coinvolti nella segnalazione immunitaria (es. B cell receptor, Toll-like receptor) e nella risposta a stress metabolico (AGE-RAGE), che nel complesso suggeriscono un impatto biologico mirato dell’inibizione epigenetica, in linea con il meccanismo d’azione di tazemetostat.
+
+Nel Set Lasco, che include anche geni con effetto più moderato, la rete risulta organizzata in più cluster funzionali. Si identificano almeno due moduli principali: uno associato a risposta immunitaria e infiammazione (es. Systemic lupus erythematosus, Antigen processing, Th1/Th2 differentiation) e un altro correlato a risposta antivirale e infezioni virali (HPV infection, viral carcinogenesis, neutrophil extracellular trap formation). Questo pattern supporta l’ipotesi che tazemetostat influenzi l’architettura epigenetica delle CAR-T, potenziandone la risposta immunitaria e i meccanismi di presentazione dell’antigene.
+
+```{r fig.width=12, fig.height=6}
+p1 <- emapplot(pairwise_termsim(enrich_kegg_strict), showCategory = 15) + ggtitle("KEGG Pathway Similarity - Enrichment Map - Set Stringente")
+p2 <- emapplot(pairwise_termsim(enrich_kegg_loose), showCategory = 15) + ggtitle("KEGG Pathway Similarity - Enrichment Map - Set Lasco")
+p1+p2
+```
+
+### 3.3.3 Mappa circolare delle connessioni tra geni e processi biologici KEGG
+
+Per approfondire la relazione tra i geni differenzialmente espressi e i pathway KEGG arricchiti, è stata utilizzata anche una Gene-Concept Network. 
+
+Nel set stringente, la rete risultante è composta da pochi pathway ben definiti. Il gene con **Entrez ID 3725**, incontrato già in precedenza quando si è parlato dei DEG chiave nel contesto dell'articolo, è **JUN**, fattore di trascrizione chiave che regola la risposta cellulare a stimoli come stress e infiammazione, risulta coinvolto in più processi (tra cui AGE-RAGE signaling, Measles e B cell receptor signaling), confermando un possibile ruolo centrale nell'effetto del trattamento. In generale, i pathway emersi riflettono una risposta mirata, in cui un numero contenuto di geni induce attivazione di processi specifici, in particolare legati all’immunità e alla segnalazione cellulare.
+
+Al contrario, nel set lasco, la rete appare molto più complessa e articolata. Numerosi geni, tra cui quello con **Entrez ID 3303** (chaperone tipicamente indotto da stress o danno cellulare appartente ai DEG del set stringente), risultano condivisi tra diversi pathway, principalmente associati a infezioni virali, risposte autoimmuni e presentazione dell'antigene, che si aggregano in cluster funzionali coerenti.
+
+```{r fig.width=14, fig.height=6}
+p1 <- plot_cnet(enrich_kegg_strict, logfc_strict, "Gene-Concept Network - KEGG Enrichment - Set Stringente")
+p2 <- plot_cnet(enrich_kegg_loose,  logfc_loose,  "Gene-Concept Network - KEGG Enrichment - Set Lasco")
+p1+p2
+```
+
+### 3.3.4 Visualizzazione dettagliata di pathway KEGG
+
+Dopo aver identificato i pathway significativamente arricchiti tramite l'analisi KEGG, è utile esplorarne la struttura molecolare dettagliata. Per questo scopo, si utilizza il pacchetto ggkegg, che consente di scaricare e visualizzare un singolo pathway KEGG come **grafo biologico**, il cui layout e la cui grafica permettono di evidenziare la struttura interna del pathway, aiutando a capire meglio come la cellula risponde al trattamento.
+
+Per ciascun set (stringente e lasco), sono state quindi visualizzate la mappe dettagliate dei pathway KEGG più significativi e rappresentativi del problema biologico in esame.
+
+Ricordando che il dataset GSE267074 proviene da uno studio su modelli murini di linfoma B-NHL trattati con cellule CAR‑T anti-CD19, con o senza inibizione epigenetica di EZH2 tramite tazemetostat, l’obiettivo è valutare come tale inibizione moduli l’espressione genica tumorale e potenzi la risposta immunitaria, con particolare attenzione a infiammazione, segnalazione immunitaria e risposta a immunoterapia.
+
+#### **Pathway più significativi del Set stringente**
+
+In questa sezione si visualizzano graficamente i pathway più significativi relativi al Set stringente di DEG e più coerenti con l'articolo in esame.
+
+Numero totale di pathway arricchiti:
+
+```{r}
+# Visualizza il numero totale di pathway arricchiti
+print(nrow(enrich_kegg_strict@result))
+```
+Numero totale di pathway significativamente arricchiti (con p.adjust < 0.05):
+
+```{r}
+# Visualizza il numero pathway significativamente arricchiti (p.adjust < 0.05)
+print(sum(enrich_kegg_strict@result$p.adjust < 0.05))
+```
+Lista dei pathway più significativamente arricchiti: 
+
+```{r}
+head(enrich_kegg_strict@result[, c("ID", "Description", "pvalue", "p.adjust")], 7)
+```
+
+Tra questi i più coerenti con il lavoro di riferimento sono:
+
+1) **Toll‑like receptor signaling pathway (hsa04620)**
+
+I Toll-like receptors (TLRs) sono recettori dell’immunità innata che attivano la produzione di interferoni di tipo I (IFN-I) e citochine pro-infiammatorie come TNF‑α, IL‑6 e IL‑1, discusse anche nell'articolo.
+In questo pathway risulta incluso il gene TLR7, che nei dati risulta differenzialmente espresso. Si osserva inoltre una maggiore espressione di molecole costimolatorie come CD40, CD80 e CD86, che possono potenziare l’attivazione dei linfociti T e contribuire a una risposta immunitaria antitumorale più efficace e duratura.
+
+```{r fig.width=12, fig.height=6}
+# Visualizzazione pathway Toll‑like receptor signaling
+analyze_pathway(enrich_kegg_strict@result$ID[6])
+```
+
+
+2) **B cell receptor signaling pathway (hsa04662)**
+
+Il linfoma B, oggetto del lavoro GSE267074, deriva da cellule B maligne in cui la via del B cell receptor (BCR) è spesso iperattiva, contribuendo a proliferazione, sopravvivenza e resistenza alla terapia.
+Questa via è biologicamente rilevante anche nel contesto della terapia CAR‑T CD19, poiché la modulazione del BCR può influenzare la sensibilità immunitaria del tumore.
+Inoltre, l’inibizione di EZH2, come mostrato nell’articolo, può rimodellare l’espressione genica delle cellule B, compresi geni coinvolti in attivazione e adesione, rendendo questo pathway ancora più coerente col background molecolare della malattia.
+
+```{r fig.width=12, fig.height=6}
+# Visualizzazione pathway B cell receptor signaling pathway
+analyze_pathway(enrich_kegg_strict@result$ID[3])
+```
+
+Anche il pathway **Measles (hsa05162)**, seppur non direttamente coinvolto, riflette un’attivazione della risposta interferonica attraverso ISG comuni.
+
+#### **Pathway più significativi del Set lasco**
+
+In questa sezione si illustrano graficamente i pathway più significativi e biologicamente rilevanti emersi dal set lasco di DEG, in accordo con quanto descritto nell’articolo analizzato.
+
+Numero totale di pathway arricchiti:
+
+```{r}
+# Visualizza il numero totale di pathway arricchiti
+print(nrow(enrich_kegg_loose@result))
+```
+Numero totale di pathway significativamente arricchiti (con p.adjust < 0.05):
+
+```{r}
+# Visualizza il numero pathway significativamente arricchiti (p.adjust < 0.05)
+print(sum(enrich_kegg_loose@result$p.adjust < 0.05))
+```
+I pathway più significativamente arricchiti: 
+
+```{r}
+head(enrich_kegg_loose@result[, c("ID", "Description", "pvalue", "p.adjust")], 16)
+```
+
+Tra questi i più coerenti con l'articolo sono:
+
+1) **Neutrophil extracellular trap (NET) formation (hsa04613)**
+
+L’arricchimento di questo pathway suggerisce una marcata attivazione dell’immunità innata in seguito al trattamento combinato CAR‑T + EZH2i. Le NET, strutture composte da DNA extracellulare e proteine tossiche rilasciate dai neutrofili, contribuiscono alla risposta infiammatoria sistemica e al rimodellamento del microambiente tumorale. Sebbene i neutrofili non siano il bersaglio diretto delle CAR‑T, la loro attivazione riflette un contesto infiammatorio coerente con i dati trascrittomici dello studio, che mostrano un aumento di citochine pro-infiammatorie (es. IFN‑γ, TNF‑α) e geni associati alla segnalazione TLR e MAPK. Il coinvolgimento della NETosi conferma il ruolo centrale dell’infiammazione nell’efficacia della terapia combinata.
+
+```{r fig.width=10, fig.height=8}
+# Visualizzazione pathway Neutrophil extracellular trap (NET) formation
+analyze_pathway(enrich_kegg_loose@result$ID[2])
+```
+
+2) **Antigen processing and presentation (hsa04612)**
+
+L’efficacia delle CAR‑T CD19, cellule T ingegnerizzate per riconoscere e uccidere cellule tumorali che esprimono CD19, una proteina presente sulla superficie delle cellule B (sia normali che maligne), dipende dalla capacità delle cellule tumorali di esprimere l’antigene bersaglio (CD19) e di presentare antigeni peptidici attraverso il complesso maggiore di istocompatibilità (MHC), meccanismo fondamentale per l’attivazione della risposta T.
+In particolare, questo pathway regola il processamento degli antigeni intracellulari (ad esempio derivanti da proteine tumorali) e la loro esposizione in superficie tramite MHC, per il riconoscimento da parte dei linfociti T.
+Lo studio mostra che l’inibizione di EZH2 favorisce la riattivazione di geni silenziati coinvolti in questi meccanismi, aumentando così l’immunogenicità del tumore e migliorando la sinergia con la terapia CAR‑T.
+
+```{r fig.width=10, fig.height=8}
+# Visualizzazione pathway Antigen processing and presentation
+analyze_pathway(enrich_kegg_loose@result$ID[5])
+```
+
+3) **Th1 and Th2 cell differentiation (hsa04658)**
+
+Questo pathway regola come si sviluppano due tipi di cellule T, chiamate Th1 e Th2. Il trattamento combinato con CAR‑T e inibitore di EZH2 spinge il sistema immunitario verso il tipo Th1, che è più adatto a combattere i tumori perché produce molecole come IFN‑γ. Questo suggerisce che la terapia aiuta a creare un ambiente più favorevole per l’azione delle CAR‑T contro le cellule tumorali.
+
+```{r fig.width=12, fig.height=6}
+# Visualizzazione pathway Th1 and Th2 cell differentiation
+analyze_pathway(enrich_kegg_loose@result$ID[7])
+```
+Si cita inoltre anche il **Systemic lupus erythematosus (hsa05322)**, che riflette una forte attivazione della risposta interferonica attraverso geni ISG noti; il lupus infatti è una malattia che riguarda l'iperattivazione della risposta interferonica, e, nello studio, è proprio l’attivazione delle vie dell’interferone ad essere associata al potenziamento dell’attività delle CAR‑T.
+
+Con lo scopo di valutare la **robustezza** dei risultati ottenuti, è stata identificata l’*intersezione* tra i pathway arricchiti nei due set (stringente e meno stringente): in particolare è stato verificato se i pathway di interesse, illustrati sopra, fossero condivisi da entrambi i set.
+
+```{r}
+# ID dei pathway da ciascun oggetto
+loose_ids <- enrich_kegg_loose@result$ID
+strict_ids <- enrich_kegg_strict@result$ID
+
+# Trova gli ID in comune
+common_ids <- intersect(loose_ids, strict_ids)
+
+# ID di interesse
+my_ids <- c("hsa04620", "hsa04662", "hsa04658","hsa04613","hsa04612")
+
+# Verifica se ciascun ID è nei common_ids
+my_ids %in% common_ids
+```
+Da questa analisi è emerso che i *pathway chiave compaiono in entrambi i set* (con livelli di significatività statistica differente): questo suggerisce che i segnali biologici rilevati siano solidi, coerenti e indipendenti dalla soglia di logFC adottata.
+
+# 4. Conclusioni
+
+L’analisi bioinformatica dei dati RNA-seq dello studio GSE267074 ha evidenziato che il trattamento combinato cellule CAR‑T CD19 + inibitore di EZH2 (tazemetostat) induce modifiche significative nell’espressione genica nei modelli murini portatori di xenotrapianti di linfoma B. In particolare, è stata riscontrata una modulazione delle vie legate alla risposta immunitaria, all’infiammazione e alla presentazione degli antigeni, con un potenziamento dell’attività immunitaria sia innata che adattativa. Tali risultati risultano coerenti con le osservazioni riportate nello studio originale, confermando che l’inibizione epigenetica ottenuta grazie al tazemetostat favorisce una maggiore efficacia delle cellule CAR‑T. 
+In conclusione, il lavoro supporta l’idea che combinare immunoterapia e modulazione epigenetica possa essere una strategia efficace per trattare i tumori derivati da cellule B.
+
+# Session Info
+
+```{r, tidy=TRUE}
+sessionInfo()
+```
