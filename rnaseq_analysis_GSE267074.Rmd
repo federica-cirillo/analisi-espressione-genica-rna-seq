@@ -71,7 +71,7 @@ library(dplyr)               # Manipolazione dati
 
 ```{r}
 # Richiama il file contenenti le funzioni documentate
-source("FunzioniEsame_FedericaCirillo.R")
+source("helper_functions.R")
 ```
 
 La prima fase consiste nell’ottenere i **dati grezzi di espressione genica da un esperimento di bulk RNA-seq**, partendo dalla repository pubblica GEO (Gene Expression Omnibus).
